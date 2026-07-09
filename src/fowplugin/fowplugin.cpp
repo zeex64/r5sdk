@@ -58,6 +58,9 @@ struct FOWPlayerState
 	int slot;
 	int edict;
 	int team;
+	int audioLocalBits;
+	int audioEventTick;
+	unsigned int audioSignature;
 	Vector3D origin;
 	Vector3D eye;
 	Vector3D velocity;
@@ -195,6 +198,8 @@ static ConVar fow_debug("fow_debug", "0", FCVAR_DEVELOPMENTONLY, "Enables fog-of
 static ConVar fow_debug_snapshots("fow_debug_snapshots", "0", FCVAR_DEVELOPMENTONLY, "Logs every fog-of-war snapshot hook call instead of throttling.", false, 0.f, true, 1.f);
 static ConVar fow_trace_duration("fow_trace_duration", "5", FCVAR_DEVELOPMENTONLY, "Debug overlay lifetime for fog-of-war trace diagnostics.", true, 0.f, false, 0.f);
 static ConVar fow_reveal_radius("fow_reveal_radius", "1500", FCVAR_DEVELOPMENTONLY, "Keeps enemy players visible inside this radius even without LOS. 0 disables the radius override.", true, 0.f, false, 0.f);
+static ConVar fow_audio_reveal("fow_audio_reveal", "1", FCVAR_DEVELOPMENTONLY, "Keeps enemy players transmitted while their local audio is active.", false, 0.f, true, 1.f);
+static ConVar fow_audio_reveal_hold("fow_audio_reveal_hold", "1.25", FCVAR_DEVELOPMENTONLY, "Keeps enemy players transmitted for this many seconds after a detected audio event.", true, 0.f, false, 0.f);
 static ConVar fow_peek_enable("fow_peek_enable", "1", FCVAR_DEVELOPMENTONLY, "Enables early reveal LOS traces from nearby peek-assist positions.", false, 0.f, true, 1.f);
 static ConVar fow_peek_forward("fow_peek_forward", "64", FCVAR_DEVELOPMENTONLY, "Forward peek-assist trace offset toward the target.", true, 0.f, false, 0.f);
 static ConVar fow_peek_side("fow_peek_side", "32", FCVAR_DEVELOPMENTONLY, "Side peek-assist trace offset perpendicular to the target direction.", true, 0.f, false, 0.f);
@@ -443,6 +448,40 @@ int GetRevealHoldTicks(const FOWPublishedSnapshot& snapshot)
 		return 1;
 
 	return Max(1, static_cast<int>(ceilf(FOW_REVEAL_HOLD_SECONDS / snapshot.tickInterval)));
+}
+
+int GetAudioRevealHoldTicks(const FOWPublishedSnapshot& snapshot)
+{
+	if (snapshot.tickInterval <= 0.0f)
+		return 1;
+
+	return Max(1, static_cast<int>(ceilf(fow_audio_reveal_hold.GetFloat() / snapshot.tickInterval)));
+}
+
+void HashAudioBytes(unsigned int& hash, const void* const data, const size_t size)
+{
+	const unsigned char* bytes = static_cast<const unsigned char*>(data);
+	for (size_t i = 0; i < size; ++i)
+	{
+		hash ^= bytes[i];
+		hash *= 16777619u;
+	}
+}
+
+unsigned int BuildAudioSignature(CPlayer* const player)
+{
+	if (!player)
+		return 0u;
+
+	unsigned int hash = 2166136261u;
+	HashAudioBytes(hash, player->GetLastBodySound3P(), 32);
+	HashAudioBytes(hash, player->GetLastFinishSound3P(), 32);
+	HashAudioBytes(hash, player->GetPrimedSound3P(), 32);
+	HashAudioBytes(hash, player->GetReplayImportantSoundIDs(), sizeof(int) * 4);
+	HashAudioBytes(hash, player->GetReplayImportantSoundBeginTimes(), sizeof(float) * 4);
+	const float lastDamaged = player->GetLastTimeDamagedByOtherPlayer();
+	HashAudioBytes(hash, &lastDamaged, sizeof(lastDamaged));
+	return hash;
 }
 
 float GetEffectiveLookaheadSeconds(const FOWPlayerState& observer, const float tickInterval)
@@ -1113,6 +1152,7 @@ bool TryPublishAsyncResultLocked()
 
 void CapturePlayersLocked(CServer* const server)
 {
+	const FOWPublishedSnapshot& previous = GetPublishedSnapshot();
 	FOWPublishedSnapshot& snapshot = GetBuildSnapshot();
 	ClearPlayerStates(snapshot);
 	ResetVisibility(snapshot);
@@ -1145,6 +1185,21 @@ void CapturePlayersLocked(CServer* const server)
 		state.slot = slot;
 		state.edict = edict;
 		state.team = player->GetTeamNum();
+		state.audioLocalBits = player->GetLocalData().GetAudioParams().localBits;
+		state.audioSignature = BuildAudioSignature(player);
+		state.audioEventTick = 0;
+		if (slot < previous.maxClients && previous.players[slot].valid)
+		{
+			state.audioEventTick = previous.players[slot].audioEventTick;
+			if (previous.players[slot].audioSignature != state.audioSignature)
+				state.audioEventTick = server->GetTick();
+		}
+		else if (state.audioSignature != 0u)
+		{
+			state.audioEventTick = server->GetTick();
+		}
+		if (state.audioLocalBits != 0)
+			state.audioEventTick = server->GetTick();
 		state.origin = player->GetAbsOrigin();
 		state.eye = state.origin;
 		state.eye.x += player->GetViewOffset().x;
@@ -1197,6 +1252,17 @@ bool ShouldPreserveRelatedEdict(const int edict)
 	return false;
 }
 
+bool HasActiveAudioReveal(const FOWPublishedSnapshot& snapshot, const FOWPlayerState& target)
+{
+	if (!fow_audio_reveal.GetBool())
+		return false;
+
+	if (target.audioLocalBits != 0)
+		return true;
+
+	return target.audioEventTick > 0 && (snapshot.frameTick - target.audioEventTick) <= GetAudioRevealHoldTicks(snapshot);
+}
+
 bool ShouldHidePlayer(const FOWPublishedSnapshot& snapshot, const unsigned int observerSlot, const int targetSlot, int* const targetEdict, const char** const reason)
 {
 	if (observerSlot >= FOW_MAX_CLIENTS || targetSlot < 0 || targetSlot >= snapshot.maxClients)
@@ -1212,19 +1278,22 @@ bool ShouldHidePlayer(const FOWPublishedSnapshot& snapshot, const unsigned int o
 	}
 
 	const bool rawVisible = snapshot.visible[observerSlot][targetSlot];
+	const bool audioReveal = HasActiveAudioReveal(snapshot, snapshot.players[targetSlot]);
 	const int revealHoldTicks = GetRevealHoldTicks(snapshot);
-	if (rawVisible)
+	if (rawVisible || audioReveal)
 	{
 		g_fowRevealUntilTick[observerSlot][targetSlot] = snapshot.frameTick + revealHoldTicks;
 		if (fow_debug.GetBool() && g_fowLastHidden[observerSlot][targetSlot])
 		{
 			Msg(eDLL_T::SERVER,
-				"FOW transition: tick=%d observer=%u target=%d hidden=0 held=0\n",
+				"FOW transition: tick=%d observer=%u target=%d hidden=0 held=0 reason=%s\n",
 				snapshot.frameTick,
 				observerSlot,
-				targetSlot);
+				targetSlot,
+				audioReveal ? "audio" : "visible");
 		}
 		g_fowLastHidden[observerSlot][targetSlot] = false;
+		*reason = audioReveal ? "audio" : "visible";
 		return false;
 	}
 
