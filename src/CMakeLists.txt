@@ -88,6 +88,7 @@ add_subdirectory( loader )
 
 set( FOLDER_CONTEXT "Plugins" )
 add_subdirectory( pluginsdk )
+add_subdirectory( crouchspamplugin )
 add_subdirectory( uisdk )
 
 set( FOLDER_CONTEXT "Game" )
